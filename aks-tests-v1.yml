@@ -1,0 +1,229 @@
+parameters:
+  - name: environment
+    displayName: Environment
+    type: string
+
+  - name: testTags
+    displayName: "Test markers to use (comma delimited). Leave empty to run all tests"
+    type: string
+    default: ""
+
+steps:
+  - template: aks-config-v1.yml
+    parameters:
+      environment: ${{ parameters.environment }}
+
+  - task: UsePythonVersion@0
+    displayName: "Use Python 3.11"
+    inputs:
+      versionSpec: '3.11'
+      addToPath: true
+
+  - task: HelmInstaller@1
+    displayName: "Install Helm CLI on agent"
+    inputs:
+      helmVersionToInstall: 'latest'
+
+  - script: |
+      find . -name "*.pyc" -delete
+      find . -name "__pycache__" -type d -exec rm -rf {} +
+    displayName: 'Clean Python cache'
+    workingDirectory: $(System.DefaultWorkingDirectory)
+
+
+  - task: AzureCLI@2
+    displayName: "Run AKS pytest tests (Azure auth)"
+    inputs:
+      azureSubscription: "Azure Deployment"
+      addSpnToEnvironment: true
+      visibleAzLogin: false
+      scriptType: bash
+      scriptLocation: inlineScript
+      workingDirectory: $(System.DefaultWorkingDirectory)
+      inlineScript: |
+        set -eo pipefail
+
+        echo "$ENV_SUBSCRIPTION"
+        az account set --subscription "$ENV_SUBSCRIPTION" --only-show-errors > /dev/null
+
+        SUB_ID="$(az account show --query id -o tsv --only-show-errors)"
+        echo "[INFO] Active subscription now: ${SUB_ID}"
+
+        python -m pip install --upgrade pip
+        pip install -r Platform.Service.AKS/Tests/requirements.txt
+        pip install pytest pytest-cov pytest-html pytest-xdist pytest-rerunfailures
+
+        mkdir -p reports
+
+        export AZURE_SUBSCRIPTION_ID="${SUB_ID}"
+        export AKS_RESOURCE_GROUP="${ENV_AKSRESOURCEGROUPNAME}"
+        export AKS_CLUSTER_NAME="${ENV_AKSCLUSTERNAME}"
+
+        # ENV_PREFIX — ADO injects env.prefixWithRegion as ENV_PREFIXWITHREGION;
+        # the tests expect the shorter name ENV_PREFIX, so we remap it here.
+        # ENV_SUFFIX — ADO injects env.suffix directly as ENV_SUFFIX (dots become
+        # underscores, name uppercased), which already matches what the tests expect.
+        # No remap needed — ENV_SUFFIX is already set by ADO before this script runs.
+        export ENV_PREFIX="${ENV_PREFIXWITHREGION}"
+
+        # Polling window for tests that check helm release / binary state.
+        # Increase this when the test job runs in parallel with a deployment job
+        # (e.g. set to 600 for a 10-minute deployment window).
+        export ENV_HELM_DEPLOY_TIMEOUT_SECONDS="${ENV_HELM_DEPLOY_TIMEOUT_SECONDS:-300}"
+
+        # Auto-detect cluster topology from Azure — no pipeline parameter needed.
+        # Queries enablePrivateCluster from the AKS API and sets AKS_CLUSTER_TOPOLOGY
+        # so conftest.py automatically skips tests that don't apply to this cluster.
+        IS_PRIVATE="$(az aks show \
+          --resource-group "${AKS_RESOURCE_GROUP}" \
+          --name "${AKS_CLUSTER_NAME}" \
+          --query "apiServerAccessProfile.enablePrivateCluster" \
+          --output tsv \
+          --only-show-errors 2>/dev/null || echo "false")"
+
+        if [[ "${IS_PRIVATE,,}" == "true" ]]; then
+          export AKS_CLUSTER_TOPOLOGY="private"
+        else
+          export AKS_CLUSTER_TOPOLOGY="public"
+        fi
+
+        echo "[INFO] AKS_RESOURCE_GROUP=${AKS_RESOURCE_GROUP}"
+        echo "[INFO] AKS_CLUSTER_NAME=${AKS_CLUSTER_NAME}"
+        echo "[INFO] AZURE_SUBSCRIPTION_ID=${AZURE_SUBSCRIPTION_ID}"
+        echo "[INFO] AKS_CLUSTER_TOPOLOGY=${AKS_CLUSTER_TOPOLOGY} (auto-detected)"
+        echo "[INFO] ENV_PREFIX=${ENV_PREFIX}"
+        echo "[INFO] ENV_SUFFIX=${ENV_SUFFIX}"
+
+        # ENV_VNET_ADDRESS_PREFIX — auto-fetch from Azure so TC-158 doesn't skip.
+        # The VNet is always named {AKS_CLUSTER_NAME}-vnet on private clusters.
+        VNET_NAME="${AKS_CLUSTER_NAME}-vnet"
+        export ENV_VNET_ADDRESS_PREFIX="$(az network vnet show \
+          --resource-group "${AKS_RESOURCE_GROUP}" \
+          --name "${VNET_NAME}" \
+          --query "addressSpace.addressPrefixes[0]" \
+          --output tsv \
+          --only-show-errors 2>/dev/null || echo "")"
+        echo "[INFO] ENV_VNET_ADDRESS_PREFIX=${ENV_VNET_ADDRESS_PREFIX} (auto-fetched from ${VNET_NAME})"
+
+        # AKS_FQDN — auto-fetch the API server FQDN so TC-152 (_resolve_api_server_url)
+        # can always determine the API server URL without requiring AKS_API_SERVER_URL
+        # or a local kubeconfig.  On private clusters this resolves privateFqdn.
+        AKS_FQDN_VAL="$(az aks show \
+          --resource-group "${AKS_RESOURCE_GROUP}" \
+          --name "${AKS_CLUSTER_NAME}" \
+          --query "fqdn" \
+          --output tsv \
+          --only-show-errors 2>/dev/null || echo "")"
+        if [[ -z "${AKS_FQDN_VAL}" || "${AKS_FQDN_VAL}" == "None" ]]; then
+          AKS_FQDN_VAL="$(az aks show \
+            --resource-group "${AKS_RESOURCE_GROUP}" \
+            --name "${AKS_CLUSTER_NAME}" \
+            --query "privateFqdn" \
+            --output tsv \
+            --only-show-errors 2>/dev/null || echo "")"
+        fi
+        export AKS_FQDN="${AKS_FQDN_VAL}"
+        echo "[INFO] AKS_FQDN=${AKS_FQDN} (auto-fetched)"
+
+        # ENV_BASTION_VNET_ID — auto-fetch from Azure by reading VNet peerings on the
+        # AKS VNet.  The first peering whose name contains "bastion" (case-insensitive)
+        # is used; if none match that pattern the first peering is used as a fallback.
+        # Required by TC-175 (AKS → bastion peering) and TC-176 (bastion → AKS peering).
+        BASTION_PEERING_ID="$(az network vnet peering list \
+          --resource-group "${AKS_RESOURCE_GROUP}" \
+          --vnet-name "${VNET_NAME}" \
+          --query "[?contains(toLower(name), 'bastion')] | [0].remoteVirtualNetwork.id" \
+          --output tsv \
+          --only-show-errors 2>/dev/null || echo "")"
+
+        # Fall back to the first peering if no "bastion" name match
+        if [[ -z "${BASTION_PEERING_ID}" ]]; then
+          BASTION_PEERING_ID="$(az network vnet peering list \
+            --resource-group "${AKS_RESOURCE_GROUP}" \
+            --vnet-name "${VNET_NAME}" \
+            --query "[0].remoteVirtualNetwork.id" \
+            --output tsv \
+            --only-show-errors 2>/dev/null || echo "")"
+        fi
+        export ENV_BASTION_VNET_ID="${BASTION_PEERING_ID}"
+        echo "[INFO] ENV_BASTION_VNET_ID=${ENV_BASTION_VNET_ID} (auto-fetched from ${VNET_NAME} peerings)"
+
+        # ENV_ACR_NAME / ENV_ACR_RESOURCE_GROUP — auto-fetch by finding the ACR on
+        # which the AKS kubelet identity holds the AcrPull role assignment.
+        # Required by TC-178 (ACR private endpoint exists), TC-179, TC-180.
+        KUBELET_OBJECT_ID="$(az aks show \
+          --resource-group "${AKS_RESOURCE_GROUP}" \
+          --name "${AKS_CLUSTER_NAME}" \
+          --query "identityProfile.kubeletidentity.objectId" \
+          --output tsv \
+          --only-show-errors 2>/dev/null || echo "")"
+
+        if [[ -n "${KUBELET_OBJECT_ID}" ]]; then
+          ACR_RESOURCE_ID="$(az role assignment list \
+            --assignee "${KUBELET_OBJECT_ID}" \
+            --role "AcrPull" \
+            --query "[0].scope" \
+            --output tsv \
+            --only-show-errors 2>/dev/null || echo "")"
+
+          if [[ -n "${ACR_RESOURCE_ID}" ]]; then
+            export ENV_ACR_NAME="$(az acr show \
+              --ids "${ACR_RESOURCE_ID}" \
+              --query name \
+              --output tsv \
+              --only-show-errors 2>/dev/null || echo "")"
+            export ENV_ACR_RESOURCE_GROUP="$(az acr show \
+              --ids "${ACR_RESOURCE_ID}" \
+              --query resourceGroup \
+              --output tsv \
+              --only-show-errors 2>/dev/null || echo "")"
+          fi
+        fi
+        export ENV_ACR_NAME="${ENV_ACR_NAME:-}"
+        export ENV_ACR_RESOURCE_GROUP="${ENV_ACR_RESOURCE_GROUP:-}"
+        echo "[INFO] ENV_ACR_NAME=${ENV_ACR_NAME} (auto-fetched via kubelet AcrPull role)"
+        echo "[INFO] ENV_ACR_RESOURCE_GROUP=${ENV_ACR_RESOURCE_GROUP} (auto-fetched via kubelet AcrPull role)"
+
+        testTags="${{ parameters.testTags }}"
+
+        pytestArgs=()
+        if [[ -n "${testTags// }" ]]; then
+          pytestArgs+=(-m "${testTags}")
+        fi
+
+        echo "[INFO] Running pytest with marker args: ${pytestArgs[*]}"
+
+        python -m pytest ./Platform.Service.AKS/Tests/AKS/ -v \
+          "${pytestArgs[@]}" \
+          --color=yes \
+          --junitxml=reports/junit.xml \
+          --cov=./Platform.Service.AKS/Tests/AKS \
+          --cov-report=xml:reports/coverage.xml \
+          --cov-report=term \
+          --html=reports/report.html --self-contained-html
+
+  - task: PublishTestResults@2
+    displayName: "Publish pytest results"
+    condition: always()
+    inputs:
+      testResultsFormat: "JUnit"
+      testResultsFiles: "reports/junit.xml"
+      failTaskOnFailedTests: true
+      testRunTitle: "Validate AKS pytest tests"
+
+  - task: PublishCodeCoverageResults@2
+    displayName: "Publish coverage (Cobertura)"
+    condition: always()
+    inputs:
+      codeCoverageTool: 'Cobertura'
+      summaryFileLocation: 'reports/coverage.xml'
+      reportDirectory: 'reports'
+      failIfCoverageEmpty: true
+
+  - task: PublishBuildArtifacts@1
+    displayName: "Publish HTML Test Report"
+    condition: always()
+    inputs:
+      PathtoPublish: 'reports/report.html'
+      ArtifactName: 'pytest-html-report'
+      publishLocation: 'Container'
